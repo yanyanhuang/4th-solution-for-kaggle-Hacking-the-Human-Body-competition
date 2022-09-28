@@ -2,6 +2,7 @@ from kaggle_hubmap_kv3 import *
 from daformer import *
 from coat import *
 import copy
+from segmentation_models_pytorch.decoders.unet.decoder import UnetDecoder
 # import lovasz_losses as L
 
 
@@ -33,7 +34,7 @@ class Net(nn.Module):
 	
 	def __init__(self,
 	             encoder=coat_lite_medium,
-	             decoder=daformer_conv3x3,
+	             decoder=None,
 	             encoder_cfg={},
 	             decoder_cfg={},
 				 encoder_ckpt=None,
@@ -41,36 +42,59 @@ class Net(nn.Module):
 	             ):
 		super(Net, self).__init__()
 		decoder_dim = decoder_cfg.get('decoder_dim', 320)
+		decoder_dim_unet = [256, 128, 64, 32, 16]
 		
 		# ----
 		self.rgb = RGB()
+
+		conv_dim = 32
+		self.conv = nn.Sequential(
+			nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+			nn.BatchNorm2d(32),
+			nn.ReLU(inplace=True),
+			nn.Conv2d(32, 32, kernel_size=3, stride=1, padding=1, bias=False),
+			nn.BatchNorm2d(32),
+			nn.ReLU(inplace=True),
+			nn.Conv2d(32, conv_dim, kernel_size=3, stride=1, padding=1, bias=False)
+		)
+		self.convs = torch.nn.ModuleList()
+		self.convs.append(self.conv)
+		self.convs.append(copy.deepcopy(self.convs[0]))
 		
-		self.encoders_coat = torch.nn.ModuleList()
-		self.encoders_coat.append(encoder())
+		self.encoder_coat = encoder(
+			#drop_path_rate=0.3,
+		)
 		if encoder_ckpt is not None:
 			checkpoint = torch.load(encoder_ckpt, map_location=lambda storage, loc: storage)
-			self.encoders_coat[0].load_state_dict(checkpoint['model'],strict=False)
+			self.encoder_coat.load_state_dict(checkpoint['model'],strict=False)
+		self.encoders_coat = torch.nn.ModuleList()
+		self.encoders_coat.append(self.encoder_coat)
 		self.encoders_coat.append(copy.deepcopy(self.encoders_coat[0]))
-		encoder_dim = self.encoders_coat[0].embed_dims
+		encoder_dim = self.encoder_coat.embed_dims
 		# [64, 128, 320, 512]
 		
 		# self.decoder_daformer = decoder(
 		# 	encoder_dim=encoder_dim,
 		# 	decoder_dim=decoder_dim,
 		# )
-		self.decoders_daformer = torch.nn.ModuleList()
-		self.decoders_daformer.append(decoder(
-			encoder_dim=encoder_dim,
-			decoder_dim=decoder_dim,
-		))
-		self.decoders_daformer.append(copy.deepcopy(self.decoders_daformer[0]))
+		self.decoder_unet = UnetDecoder(
+			encoder_channels=[0, conv_dim] + encoder_dim,
+			decoder_channels=decoder_dim_unet,
+			n_blocks=5,
+			use_batchnorm=True,
+			center=False,
+			attention_type=None,
+		)
+		self.decoders_unet = torch.nn.ModuleList()
+		self.decoders_unet.append(self.decoder_unet)
+		self.decoders_unet.append(copy.deepcopy(self.decoders_unet[0]))
 
 		# self.decoders = torch.nn.ModuleList()
 		# for _ in range(5):
 		# 	self.decoders.append(copy.deepcopy(self.decoder))
 
-		self.logit = nn.Sequential(
-			nn.Conv2d(decoder_dim, 1, kernel_size=1),
+		self.logit_unet = nn.Sequential(
+			nn.Conv2d(decoder_dim_unet[-1], 1, kernel_size=1),
 		)
 		self.output_type = ['inference', 'loss']
 		# self.aux = nn.ModuleList([
@@ -103,15 +127,26 @@ class Net(nn.Module):
 		# 	# encoder = torch.concat(encoder)
 		# else:
 		encoder = self.encoders_coat[organs[0].item() // 4](x)
-		#print([f.shape for f in encoder])
-		# import ipdb;ipdb.set_trace()
+		conv = self.convs[organs[0].item() // 4](x)
+		
+		feature = encoder[::-1]
+		head = feature[0]
+		skip = feature[1:] + [conv, None]
+		d = self.decoders_unet[organs[0].item() // 4].center(head)
+
+		decoder = []
+		for i, decoder_block in enumerate(self.decoders_unet[organs[0].item() // 4].blocks):
+			s = skip[i]
+			d = decoder_block(d, s)
+			decoder.append(d)
+		last = d
 
 		# last, decoder = self.encoder_decoders[organs[0].item() // 4](x)
-		last, decoder = self.decoders_daformer[organs[0].item() // 4](encoder)
-		logit = self.logit(last)
+		# last, decoder = self.decoders_unet[organs[0].item() // 4](encoder)
+		logit = self.logit_unet(last)
 		# import ipdb;ipdb.set_trace()
 		# print(logit.shape)
-		logit2 = F.interpolate(logit, size=None, scale_factor=4, mode='bilinear', align_corners=False)
+		# logit2 = F.interpolate(logit, size=None, scale_factor=4, mode='bilinear', align_corners=False)
 		# mask = F.interpolate(mask, size=None, scale_factor=1/4, mode='bilinear', align_corners=False)
 		
 		output = {}
@@ -121,14 +156,14 @@ class Net(nn.Module):
 		if 'loss' in self.output_type:
 			# import ipdb;ipdb.set_trace()
 			mask = batch['mask']
-			mask = F.interpolate(mask, size=None, scale_factor=1/4, mode='bilinear', align_corners=False)
+			# mask = F.interpolate(mask, size=None, scale_factor=1/4, mode='bilinear', align_corners=False)
 			# output['bce_loss'] = F.binary_cross_entropy_with_logits(logit, batch['mask'])
 			output['bce_loss'] = F.binary_cross_entropy_with_logits(logit, mask)
 			# for i in range(4):
 			# 	output['aux%d_loss'%i] = criterion_aux_loss(self.aux[i](decoder[i]),batch['mask'])
 		
 		if 'inference' in self.output_type:
-			output['probability'] = torch.sigmoid(logit2)
+			output['probability'] = torch.sigmoid(logit)
 		
 		return output
 

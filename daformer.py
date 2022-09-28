@@ -207,6 +207,13 @@ class daformer_conv3x3 (DaformerDecoder):
 			fuse = 'conv3x3',
 			**kwargs
 		)
+
+class daformer_conv1x1 (DaformerDecoder):
+	def __init__(self, **kwargs):
+		super(daformer_conv1x1, self).__init__(
+			fuse = 'conv1x1',
+			**kwargs
+		)
   
  
 if 0:

@@ -2,7 +2,8 @@ from kaggle_hubmap_kv3 import *
 from daformer import *
 from coat import *
 import copy
-# import lovasz_losses as L
+from segformer.segformer_head import SegFormerHead
+
 
 
 #################################################################
@@ -45,25 +46,24 @@ class Net(nn.Module):
 		# ----
 		self.rgb = RGB()
 		
-		self.encoders_coat = torch.nn.ModuleList()
-		self.encoders_coat.append(encoder())
+		self.encoder = encoder(
+			#drop_path_rate=0.3,
+		)
 		if encoder_ckpt is not None:
 			checkpoint = torch.load(encoder_ckpt, map_location=lambda storage, loc: storage)
-			self.encoders_coat[0].load_state_dict(checkpoint['model'],strict=False)
-		self.encoders_coat.append(copy.deepcopy(self.encoders_coat[0]))
-		encoder_dim = self.encoders_coat[0].embed_dims
+			self.encoder.load_state_dict(checkpoint['model'],strict=False)
+		self.encoders = torch.nn.ModuleList()
+		for _ in range(2):
+			self.encoders.append(copy.deepcopy(self.encoder))
+		encoder_dim = self.encoder.embed_dims
 		# [64, 128, 320, 512]
 		
-		# self.decoder_daformer = decoder(
+		# self.decoder = decoder(
 		# 	encoder_dim=encoder_dim,
 		# 	decoder_dim=decoder_dim,
 		# )
-		self.decoders_daformer = torch.nn.ModuleList()
-		self.decoders_daformer.append(decoder(
-			encoder_dim=encoder_dim,
-			decoder_dim=decoder_dim,
-		))
-		self.decoders_daformer.append(copy.deepcopy(self.decoders_daformer[0]))
+		self.feature_strides = [4, 8, 16, 32]
+		self.decoder = SegFormerHead(feature_strides=self.feature_strides, in_channels=self.encoder.embed_dims, embedding_dim=decoder_dim, num_classes=1)
 
 		# self.decoders = torch.nn.ModuleList()
 		# for _ in range(5):
@@ -73,18 +73,9 @@ class Net(nn.Module):
 			nn.Conv2d(decoder_dim, 1, kernel_size=1),
 		)
 		self.output_type = ['inference', 'loss']
-		# self.aux = nn.ModuleList([
-        #     nn.Conv2d(decoder_dim, 1, kernel_size=1, padding=0) for i in range(4)
-        # ])
-
-		# self.encoder_decoders = torch.nn.ModuleList()
-		# self.encoder_decoder = nn.Sequential(
-		# 	self.encoder,
-		# 	self.decoder
-		# )
-		# self.encoder_decoders.append(self.encoder_decoder)
-		# self.encoder_decoders.append(copy.deepcopy(self.encoder_decoder))
-
+		self.aux = nn.ModuleList([
+            nn.Conv2d(decoder_dim, 1, kernel_size=1, padding=0) for i in range(4)
+        ])
 
 	def forward(self, batch):
 		# import ipdb;ipdb.set_trace()
@@ -102,12 +93,14 @@ class Net(nn.Module):
 		# 	# import ipdb;ipdb.set_trace()
 		# 	# encoder = torch.concat(encoder)
 		# else:
-		encoder = self.encoders_coat[organs[0].item() // 4](x)
+		encoder = self.encoders[organs[0].item() // 4](x)
 		#print([f.shape for f in encoder])
 		# import ipdb;ipdb.set_trace()
 
-		# last, decoder = self.encoder_decoders[organs[0].item() // 4](x)
-		last, decoder = self.decoders_daformer[organs[0].item() // 4](encoder)
+		decoder = self.decoder(encoder)
+		last = decoder
+		# import ipdb;ipdb.set_trace()
+		# last, decoder = self.decoders[organs[0].item()](encoder)
 		logit = self.logit(last)
 		# import ipdb;ipdb.set_trace()
 		# print(logit.shape)

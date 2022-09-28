@@ -14,7 +14,7 @@ from torch.utils.data import RandomSampler
 from torch.utils.data import SequentialSampler
 import torch.nn.functional as F
 # from torchmetrics.functional import dice_score
-# from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from swin import Net
 from kaggle_hubmap_kv3 import *
 import importlib
@@ -26,6 +26,7 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 import numpy as np
+import staintools
 # from itertools import repeat
 # import collections.abc
 
@@ -61,7 +62,7 @@ organ_threshold = {
     },
 }
 
-def do_tta_batch(image):
+def do_tta_batch(image, mask):
     
     batch = { #<todo> multiscale????
         'image': torch.stack([
@@ -69,6 +70,11 @@ def do_tta_batch(image):
             torch.flip(image,dims=[1]),
             torch.flip(image,dims=[2]),
         ]),
+        'mask': torch.stack([
+            mask,
+            torch.flip(mask,dims=[1]),
+            torch.flip(mask,dims=[2]),
+        ])
         # 'organ': torch.Tensor(
         #     [[organ_to_label[organ]]]*3
         # ).long()
@@ -112,22 +118,6 @@ def load_net_test(model):
     print('ok!')
     return net
 
-def load_net(model):
-    print('\tload %s ... '%(model.module),end='',flush=True)
-    M = importlib.import_module(model.module)
-    # num = len(model.checkpoint)
-    net = []
-    # for f in range(num):
-    n = M.Net(**model.param)
-    # n.load_state_dict(
-    #     torch.load(model.checkpoint[f], map_location=lambda storage, loc: storage) ['state_dict'],
-    #     strict=False)
-    n.cuda()
-    n.train()
-    net.append(n)
-        
-    print('ok!')
-    return net
 
 def enc2mask(mask_rle, shape):
     img = np.zeros(shape[0]*shape[1], dtype=np.uint8)
@@ -223,6 +213,18 @@ def train_augment5b(image, mask, organ):
 
     return image, mask
 
+def stain_aug(image):
+
+    for fn in np.random.choice([
+        lambda image: (image),
+        lambda image: normalizer.transform(image),
+    ], 1): image = fn(image)
+    return image
+
+target_img = read_tiff(os.path.join('/home/r10user9/Documents/hhb/dataset/test_images/10078.tiff'), 'rgb')
+normalizer = staintools.ReinhardColorNormalizer()
+normalizer.fit(target_img)
+
 def do_random_flip(image, mask):
     if np.random.rand()>0.5:
         image = cv2.flip(image,0)
@@ -298,12 +300,17 @@ def do_random_rotate_scale(image, mask, angle=30, scale=[0.8,1.2] ):
     return image, mask
 
 #%% Dataset
-image_size = 1536
+# image_size = 1536
+# image_size = 1024
 
 class HubmapDataset(Dataset):
-    def __init__(self, df, augment=None):
-
+    def __init__(self, df, augment=None, train=None, group_id=0, image_size=None):
+        # if group_id == 0:
+        #     df = df[df['organ'] != 'lung'].reset_index(drop=True)
+        # elif group_id == 1:
+        #     df = df[df['organ'] == 'lung'].reset_index(drop=True)
         self.df = df
+        self.image_size = image_size
         self.augment = augment
         self.length = len(self.df)
         ids = pd.read_csv(LABELS).id.astype(str).values
@@ -314,6 +321,8 @@ class HubmapDataset(Dataset):
                                'largeintestine' : 2,
                                'spleen' : 3,
                                'lung' : 4}
+        self.train = train
+        self.train_dirs = [TRAIN, TRAIN.replace('train_images', 'train_reinhard_images')]
         # import ipdb;ipdb.set_trace()
 
     def __str__(self):
@@ -336,8 +345,16 @@ class HubmapDataset(Dataset):
         fname = d.id
         organ = self.organ_to_label[d.organ]
 
-        tiff_file = os.path.join(TRAIN, str(fname) + '.tiff')
+        if self.train == True:
+            train_dir = self.train_dirs[np.random.randint(2)]
+        else:
+            train_dir = self.train_dirs[0]
+
+        tiff_file = os.path.join(train_dir, str(fname) + '.tiff')
         tiff = read_tiff(tiff_file, 'rgb')
+        # stain_aug
+        # if self.train == True:
+        #     tiff = stain_aug(tiff)
         image = tiff.astype(np.float32)/255
 
         rle = d.rle
@@ -349,9 +366,9 @@ class HubmapDataset(Dataset):
         # image = image.astype(np.float32)/255
         # mask  = mask.astype(np.float32)/255
 
-        s = d.pixel_size/0.4 * (image_size/3000)
-        image = cv2.resize(image,dsize=(image_size,image_size),interpolation=cv2.INTER_LINEAR)
-        mask  = cv2.resize(mask, dsize=(image_size,image_size),interpolation=cv2.INTER_LINEAR)
+        s = d.pixel_size/0.4 * (self.image_size/3000)
+        image = cv2.resize(image,dsize=(self.image_size,self.image_size),interpolation=cv2.INTER_LINEAR)
+        mask  = cv2.resize(mask, dsize=(self.image_size,self.image_size),interpolation=cv2.INTER_LINEAR)
 
         if self.augment is not None:
             image, mask = self.augment(image, mask, organ)
@@ -477,20 +494,23 @@ def validate(n, valid_loader, epoch):
     global best_dice
     global best_valepoch
 
-    # all_net = all_net.eval()
+    n = n.eval()
     start_timer = time.time()
     for t, batch in enumerate(valid_loader):
         organ = batch['organ'][0].item()
         organ_list.append(organ)
         data_source = batch['data_source'][0]
         # import ipdb;ipdb.set_trace()
-        val_batch = do_tta_batch(batch['image'][0])
-        val_batch['image'] = val_batch['image'].cuda()
+        val_batch = do_tta_batch(batch['image'][0], batch['mask'][0])
+        # val_batch['image'] = val_batch['image'].cuda()
         # import ipdb;ipdb.set_trace()
         batch_size = len(batch['index'])
-        batch['image'] = batch['image'].cuda()
-        batch['mask' ] = batch['mask' ].cuda()
+        valid_mask.append(batch['mask'].data.cpu().numpy())
+        # batch['image'] = batch['image'].cuda()
+        batch['image'] = val_batch['image'].cuda()
+        batch['mask' ] = val_batch['mask' ].cuda()
         batch['organ'] = batch['organ'].cuda()
+        # import ipdb;ipdb.set_trace()
 
 
         # net.output_type = ['loss', 'inference']
@@ -502,16 +522,16 @@ def validate(n, valid_loader, epoch):
                 #     for n in net:
                 use += 1
                 n = n.eval()
-                n.output_type = ['inference']
-                output = n(val_batch)
+                n.output_type = ['inference', 'loss']
+                output = n(batch)
                 probability += output['probability']
-                # loss0  = output['bce_loss'].mean()
+                loss0  = output['bce_loss'].mean()
                 probability = undo_tta_batch(probability/use)
         # import ipdb;ipdb.set_trace()
         valid_probability.append(probability.data.cpu().numpy()[np.newaxis, :] > organ_threshold[data_source][organ])
-        valid_mask.append(batch['mask'].data.cpu().numpy())
+        # valid_mask.append(batch['mask'].data.cpu().numpy())
         valid_num += batch_size
-        # valid_loss += batch_size*loss0.item()
+        valid_loss += batch_size*loss0.item()
 
         #debug
         # if 0 :
@@ -558,17 +578,60 @@ def validate(n, valid_loader, epoch):
 def get_learning_rate(optimizer):
     return optimizer.param_groups[0]['lr']
 
+# def load_net(model):
+#     print('\tload %s ... '%(model.module),end='',flush=True)
+#     M = importlib.import_module(model.module)
+#     # num = len(model.checkpoint)
+#     net = []
+#     # for f in range(num):
+#     n = M.Net(**model.param)
+#     # import ipdb;ipdb.set_trace()
+#     if len(model.checkpoint) > 0:
+#         n.load_state_dict(torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage),strict=False)
+#         # n.load_state_dict({k.replace('encoder_decoders.0.0', 'encoders_mpvit.0'):v for k, v in torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage).items()}, strict=False)
+#         # n.load_state_dict({k.replace('encoder_decoders.1.0', 'encoders_mpvit.1'):v for k, v in torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage).items()}, strict=False)
+#         # n.load_state_dict({k.replace('encoder_decoders.0.1', 'decoders_daformer.0'):v for k, v in torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage).items()}, strict=False)
+#         # n.load_state_dict({k.replace('encoder_decoders.1.1', 'decoders_daformer.1'):v for k, v in torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage).items()}, strict=False)
+#     # for para in n.encoders_mpvit.parameters():
+#     #     para.requires_grad = False
+#     n.cuda()
+#     n.train()
+#     net.append(n)
+        
+#     print('ok!')
+#     return net
+def load_net(model):
+    print('\tload %s ... '%(model.module),end='',flush=True)
+    M = importlib.import_module(model.module)
+    # num = len(model.checkpoint)
+    net = []
+    # for f in range(num):
+    n = M.Net(**model.param)
+    # import ipdb;ipdb.set_trace()
+    if len(model.checkpoint) > 0:
+        n.load_state_dict(torch.load(model.checkpoint[0], map_location=lambda storage, loc: storage),strict=False)
+    if len(model.checkpoint1) > 0:
+        n.load_state_dict(torch.load(model.checkpoint1[0], map_location=lambda storage, loc: storage),strict=False)
+    # for para in n.encoders_coat.parameters():
+    #     para.requires_grad = False
+    n.cuda()
+    n.train()
+    net.append(n)
+        
+    print('ok!')
+    return net
+
 from coat import *
 from daformer import *
 
 best_dice = 0
 best_valepoch = 0
 
-def run(fold, patience, start_lr, gpu):
+def run(fold, patience, start_lr, gpu, group_id, image_size):
     os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu}"
     # fold = 0
-
-    out_dir = os.path.join(root_dir, f'result/coat_1536/fold-{fold}')
+    # image_size = image_size
+    out_dir = os.path.join(root_dir, f'result/mpvit_daformer_unet_{image_size}_2model_2stainnorm_lova/fold-{fold}')
     if not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
     # import ipdb;ipdb.set_trace()
@@ -576,7 +639,7 @@ def run(fold, patience, start_lr, gpu):
     initial_checkpoint = None
 
     # start_lr   = 4e-5 #0.0001
-    batch_size = 1 #32 #32
+    batch_size = 2 #32 #32
 
 
     ## setup  ----------------------------------------
@@ -594,15 +657,15 @@ def run(fold, patience, start_lr, gpu):
     train_df, valid_df = make_fold(fold)
     # import ipdb;ipdb.set_trace()
 
-    train_dataset = HubmapDataset(train_df, train_augment5b)
-    valid_dataset = HubmapDataset(valid_df, valid_augment5)
+    train_dataset = HubmapDataset(train_df, train_augment5b, train=True, group_id=group_id, image_size=image_size)
+    valid_dataset = HubmapDataset(valid_df, valid_augment5, train=False, group_id=group_id, image_size=image_size)
 
     train_loader  = DataLoader(
         train_dataset,
         sampler = RandomSampler(train_dataset),
-        batch_size  = batch_size,
+        batch_size  = 1,
         drop_last   = True,
-        num_workers = 8,
+        num_workers = 2,
         pin_memory  = False,
         worker_init_fn = lambda id: np.random.seed(torch.initial_seed() // 2 ** 32 + id),
         collate_fn = null_collate,
@@ -613,7 +676,7 @@ def run(fold, patience, start_lr, gpu):
         sampler = SequentialSampler(valid_dataset),
         batch_size  = 1,
         drop_last   = False,
-        num_workers = 4,
+        num_workers = 2,
         pin_memory  = False,
         collate_fn = null_collate,
     )
@@ -629,32 +692,238 @@ def run(fold, patience, start_lr, gpu):
     log.write('** net setting **\n')
 
     scaler = amp.GradScaler(enabled = is_amp)
-    # net = Net(cfg=cfg).cuda()
-
-    # if initial_checkpoint is not None:
-    #     f = torch.load(initial_checkpoint, map_location=lambda storage, loc: storage)
-    #     start_iteration = f['iteration']
-    #     start_epoch = f['epoch']
-    #     state_dict  = f['state_dict']
-    #     net.load_state_dict(state_dict,strict=False)  #True
-    # else:
-    #     start_iteration = 0
-    #     start_epoch = 0
-    #     net.load_pretrain(cfg=cfg)
 
 
-    # log.write('\tinitial_checkpoint = %s\n' % initial_checkpoint)
-    # log.write('\n')
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_pvtv2_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/pvt_v2_b4.pth'},
+    #         checkpoint = [
+    #             '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_cswin_upernet',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/upernet_cswin_small.pth'},
+    #         checkpoint = [
+    #             '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_coatsmall_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/coat_small_7479cf9b.pth'},
+    #         checkpoint = [
+    #             '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_daformer_coat',
+    #         param={'encoder': coat_lite_medium, 'decoder': daformer_conv3x3, 'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/coat_lite_medium_384x384_f9129688.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt'
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_coat_unet',
+    #         param={'encoder': coat_lite_medium, 'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/coat_lite_medium_384x384_f9129688.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_1024_2model_stainaug/fold-0/fold-0_207.00000000018042.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_1024_2model_stainaug/fold-1/fold-1_149.99999999998744.pt'
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_1024_2model_stainaug/fold-2/fold-2_181.9999999998965.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_1024_2model_stainaug/fold-3/fold-3_117.0000000000373.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_1024_2model_stainaug/fold-4/fold-4_102.00000000002004.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_coat_daformer_unet',
+    #         param={'encoder': coat_lite_medium, 'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/coat_lite_medium_384x384_f9129688.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt'
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #         checkpoint1 = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_unet_1024_2model_2stainnorm/fold-0/fold-0_123.00000000006584.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_unet_1024_2model_2stainnorm/fold-1/fold-1_146.99999999999596.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_unet_1024_2model_2stainnorm/fold-2/fold-2_79.99999999999471.pt'
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_unet_1024_2model_2stainnorm/fold-3/fold-3_40.999999999995744.pt'
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/coat_unet_1024_2model_2stainnorm/fold-4/fold-4_66.99999999997975.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mit_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/segformer.b3.512x512.ade.160k.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_stainaug/fold-0/fold-0_253.00000000024318.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_stainaug/fold-1/fold-1_193.99999999986238.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_stainaug/fold-2/fold-2_271.9999999996407.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_stainaug/fold-3/fold-3_216.999999999797.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_stainaug/fold-4/fold-4_278.9999999996208.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mit_unet',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/segformer.b4.512x512.ade.160k.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mit_daformer_unet',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/segformer.b3.512x512.ade.160k.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #         checkpoint1 = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_unet_1024_2model_2stainnorm/fold-0/fold-0_40.000000000000355.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_unet_1024_2model_2stainnorm/fold-1/fold-1_42.99999999999405.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_unet_1024_2model_2stainnorm/fold-2/fold-2_93.00000000000968.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_unet_1024_2model_2stainnorm/fold-3/fold-3_226.9999999997686.pt',
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/mit_unet_1024_2model_2stainnorm/fold-4/fold-4_145.00000000000165.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_pvtv2_unet',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/pvt_v2_b4.pth'},
+    #         checkpoint = [
+    #             '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mpvit_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/upernet_mpvit_small.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mpvit_unet',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/upernet_mpvit_small.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+    #             '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #     ),
+    # ]
     model = [
         dotdict(
             is_use = 1,
-            module = 'model_daformer_coat',
-            param={'encoder': coat_lite_medium, 'decoder': daformer_conv3x3, 'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/coat_lite_medium_384x384_f9129688.pth'},
+            module = 'model_mpvit_daformer_unet',
+            param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/upernet_mpvit_small.pth'},
             checkpoint = [
-                '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+                '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+            ],
+            checkpoint1 = [
+                '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_unet_1024_2model_2stainnorm/fold-0/fold-0_241.0000000002268.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_unet_1024_2model_2stainnorm/fold-1/fold-1_88.00000000000392.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_unet_1024_2model_2stainnorm/fold-2/fold-2_151.99999999998175.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_unet_1024_2model_2stainnorm/fold-3/fold-3_273.999999999635.pt',
+                # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_unet_1024_2model_2stainnorm/fold-4/fold-4_68.99999999998205.pt'
             ],
         ),
     ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_mscan_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/segnext_large_512x512_ade_160k.pth'},
+    #         checkpoint = [
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-0/fold-0_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-1/fold-1_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-2/fold-2_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-3/fold-3_0.pt',
+    #             # '/home/r10user9/Documents/hhb/coatnet_baseline/result/mpvit_daformer_1024_2model_2stainnorm/fold-4/fold-4_0.pt'
+    #         ],
+    #     ),
+    # ]
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         # module = 'segformer.segformer',
+    #         module = 'model_segformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/segformer.b2.512x512.ade.160k.pth'},
+    #     ),
+    # ]
+
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_eff_unet',
+    #         param={},
+    #         checkpoint = [],
+    #     ),
+    # ]
+
+    # model = [
+    #     dotdict(
+    #         is_use = 1,
+    #         module = 'model_hornet_daformer',
+    #         param={'encoder_ckpt': '/home/r10user9/Documents/hhb/coatnet_baseline/pretrain_model/upernet_hornet_tiny_gf.pth'},
+    #         checkpoint = [
+    #             '../input/hubmap-submit-06-weight0/daformer_conv3x3-coat_lite_medium-aug5b-768-fold-3-swa.pth'
+    #         ],
+    #     ),
+    # ]
+
     net = [ load_net(m) for m in model if m.is_use==1 ][0][0]
 
 
@@ -676,6 +945,8 @@ def run(fold, patience, start_lr, gpu):
     # import ipdb;ipdb.set_trace()
     # optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, all_net[0][0].parameters()),lr=start_lr)
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()),lr=start_lr)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=30, verbose=True)
+    
 
     log.write('optimizer\n  %s\n'%(optimizer))
     log.write('\n')
@@ -734,14 +1005,11 @@ def run(fold, patience, start_lr, gpu):
             #         }, out_dir + '/checkpoint/%08d.model.pth' %  (iteration))
             #         pass
 
-
             if (iteration%iter_valid==0):
                 valid_loss = validate(net, valid_loader, epoch)
                 if valid_loss[0] == best_dice:
                     torch.save(net.state_dict(), out_dir + f'/fold-{fold}_{epoch}.pt')
-                # import ipdb;ipdb.set_trace()
                 pass
-
 
             if (iteration%iter_log==0) or (iteration%iter_valid==0):
                 print('\r', end='', flush=True)
@@ -753,6 +1021,7 @@ def run(fold, patience, start_lr, gpu):
 
             # one iteration update  -------------
             batch_size = len(batch['index'])
+            # import ipdb;ipdb.set_trace()
             batch['image'] = batch['image'].half().cuda()
             batch['mask'] = batch['mask'].half().cuda()
             batch['organ'] = batch['organ'].cuda()
@@ -760,7 +1029,7 @@ def run(fold, patience, start_lr, gpu):
             
 
 
-            # net.train()
+            net.train()
             # net.output_type = ['loss']
             # if 1:
             # probability = 0
@@ -773,7 +1042,7 @@ def run(fold, patience, start_lr, gpu):
                 output = net(batch)   # batch.shape: [8, 3, 768, 768], output.shape: [8, 1, 192, 192]
                 # import ipdb;ipdb.set_trace()
                 loss0  = output['bce_loss'].mean()
-                loss1  = output['aux2_loss'].mean()
+                # loss1  = output['aux2_loss'].mean()
 
             optimizer.zero_grad()
             # scaler.scale(loss0+0.2*loss1).backward()
@@ -785,7 +1054,8 @@ def run(fold, patience, start_lr, gpu):
 
 
             # print statistics  --------
-            batch_loss[:2] = [loss0.item(),loss1.item()]
+            # batch_loss[:2] = [loss0.item(),loss1.item()]
+            batch_loss[:1] = [loss0.item()]
             sum_train_loss += batch_loss
             sum_train += 1
             if t % 100 == 0:
@@ -793,11 +1063,15 @@ def run(fold, patience, start_lr, gpu):
                 sum_train_loss[...] = 0
                 sum_train = 0
 
+            # print('\r', end='', flush=True)
+            # print(message(mode='print'), end='', flush=True)
+            # epoch += 1 / len(train_loader)
+            # iteration += 1
+
             print('\r', end='', flush=True)
             print(message(mode='print'), end='', flush=True)
             epoch += 1 / len(train_loader)
             iteration += 1
-
             # if epoch - best_valepoch > patience:
             #     break
             
@@ -807,4 +1081,4 @@ def run(fold, patience, start_lr, gpu):
     log.close()
 
 if __name__ == '__main__':
-	run(fold=4, patience=30, start_lr=4e-5, gpu=3)
+	run(fold=0, patience=30, start_lr=5e-5, gpu=2, group_id=0, image_size=1024)
